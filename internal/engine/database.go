@@ -5,6 +5,7 @@ import (
 	"lamina/internal/catalog"
 	"lamina/internal/index"
 	"lamina/internal/journal"
+	"lamina/internal/reach"
 	"lamina/internal/snapshot"
 	"lamina/internal/versions"
 	"os"
@@ -13,19 +14,20 @@ import (
 )
 
 type DB struct {
-	mu           sync.RWMutex
-	dir          string
-	catalog      *catalog.Catalog
-	store        *versions.Store
-	indexes      *index.Registry
-	wal          *journal.WAL
-	sequence     uint64
-	horizon      uint64
-	transactions map[string]*Transaction
-	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	mu            sync.RWMutex
+	dir           string
+	catalog       *catalog.Catalog
+	store         *versions.Store
+	indexes       *index.Registry
+	wal           *journal.WAL
+	sequence      uint64
+	horizon       uint64
+	originJournal string
+	transactions  map[string]*Transaction
+	closed        bool
+	commits       uint64
+	conflicts     uint64
+	queries       uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -53,6 +55,9 @@ func Open(dir string) (*DB, error) {
 		d.store = image.Store
 		d.sequence = image.Sequence
 		d.horizon = image.Horizon
+		if image.Origin != nil {
+			d.originJournal = image.Origin.JournalID
+		}
 	}
 	last := w.Base + uint64(len(w.Records))
 	if d.sequence > last {
@@ -76,6 +81,13 @@ func Open(dir string) (*DB, error) {
 		}
 	}
 	return d, nil
+}
+
+// scope builds the shared reachability view used identically by online
+// historical reads and the /changes cursor check. Precheck derives the
+// same structure from the image, so the two cannot drift.
+func (d *DB) scope() reach.Scope {
+	return reach.From(d.horizon, d.sequence, d.wal.Base, d.catalog, d.store)
 }
 func (d *DB) usable() error {
 	if d.closed {

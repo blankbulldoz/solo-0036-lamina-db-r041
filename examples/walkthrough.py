@@ -3,14 +3,15 @@
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
 WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
 class Session:
- def __init__(self,binary,root,restore=None):
-  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
+ def __init__(self,binary,root,restore=None,expect=None):
+  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.expect=expect;self.process=None;self.log=None
  def start(self):
   with socket.socket() as sock:
    sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
   self.url=f'http://127.0.0.1:{port}/v1/lamina'
   args=[self.binary,'-data',str(self.root),'-listen',f'127.0.0.1:{port}']
   if self.restore:args+=['-restore',str(self.restore)];self.restore=None
+  if self.expect:args+=['-expect-digest',self.expect];self.expect=None
   self.log=tempfile.TemporaryFile();self.process=subprocess.Popen(args,stdout=self.log,stderr=self.log)
   deadline=time.monotonic()+8
   while time.monotonic()<deadline:
@@ -40,6 +41,10 @@ class Session:
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
  if not condition:raise RuntimeError(message)
+def verify(binary,image,*flags):
+ result=subprocess.run([str(binary),'-verify',str(image),*flags],capture_output=True,text=True,timeout=5)
+ require(result.returncode in (0,1,2),'verify exited unexpectedly: '+result.stderr)
+ return result.returncode,json.loads(result.stdout)
 def tuple_(n,band=None,amplitude=None):return {'sample':n,'band':band or f'b{n}','amplitude':n*10 if amplitude is None else amplitude,'valid':True}
 def seed(s):
  schema={'name':'spectra','primary':'sample','columns':[{'name':'sample','type':'int'},{'name':'band','type':'text'},{'name':'amplitude','type':'int','nullable':True},{'name':'valid','type':'bool'}]}
@@ -121,15 +126,37 @@ def walkthrough(name,binary):
     locked=subprocess.run([str(binary),'-data',str(s.root),'-listen','127.0.0.1:0'],capture_output=True,text=True,timeout=5)
     require(locked.returncode!=0 and 'already open' in locked.stderr,'exclusive directory ownership missing');observations={'checkpoint':at,'head':s.stats()['sequence']}
    elif name=='backup-restore':
+    source_jid=s.stats()['journal_id'];require(source_jid,'source journal identity missing')
     backup=s.call('GET','/backup',raw=True);path=temp/'portable.lmi';path.write_bytes(backup)
     frozen=s.query()['rows'];tx=s.begin();s.put(tx,tuple_(8));s.commit(tx)
-    other=Session(binary,temp/'restored',path).start();require(other.query()['rows']==frozen,'backup mutated with source')
+    newer=temp/'newer.lmi';newer.write_bytes(s.call('GET','/backup',raw=True))
+    # Precheck: full structural scope plus explicit demands, without
+    # expanding a second database directory on disk.
+    code,report=verify(binary,path)
+    stages=['envelope_digest','header','catalog','version_chains','unique_indexes','origin']
+    require(code==0 and report['valid'] and all(report['checks'][k] for k in stages),'precheck did not verify the full image')
+    require(report['origin']['journal_id']==source_jid,'origin lineage not carried inside the image')
+    digest=report['digest']
+    code,ok=verify(binary,path,'-want-read',f'spectra@{seed_seq}','-want-change',str(seed_seq),'-want-journal-id',source_jid)
+    require(code==0 and all(d['satisfied'] for d in ok['demands']),'reachable demands wrongly rejected')
+    code,_=verify(binary,path,'-want-read','spectra@999','-want-change','0')
+    require(code==1,'unreachable demands wrongly accepted')
+    # TOCTOU: the file changes between preview and the pinned install.
+    swapped=temp/'swapped.lmi';swapped.write_bytes(newer.read_bytes())
+    stale=subprocess.run([str(binary),'-restore',str(swapped),'-data',str(temp/'stalerestore'),'-expect-digest',digest],capture_output=True,text=True,timeout=5)
+    require(stale.returncode!=0 and not (temp/'stalerestore').exists(),'changed backup installed or target directory polluted')
+    other=Session(binary,temp/'restored',path,expect=digest).start();require(other.query()['rows']==frozen,'backup mutated with source')
+    restored_stats=other.stats()
+    require(restored_stats['journal_id']!=source_jid and restored_stats.get('origin_journal_id')==source_jid,'restored lineage identity wrong')
     tx=other.begin();other.put(tx,tuple_(9));result=other.commit(tx);other.stop();other.start()
     require(other.query()['matched']==8,'restored journal base does not continue')
     other.call('GET','/changes?after=0',status=410)
-    broken=json.loads(backup);broken['sha256']='0'*64;bad=temp/'bad.lmi';bad.write_text(json.dumps(broken))
-    failed=subprocess.run([str(binary),'-restore',str(bad),'-data',str(temp/'badrestore')],capture_output=True,text=True,timeout=5)
-    require(failed.returncode!=0 and not (temp/'badrestore').exists(),'invalid backup published');observations={'restored_commit':result,'original_sequence':seed_seq}
+    # A tampered envelope fails at the digest gate and never reaches disk.
+    broken=json.loads(backup);broken['sha256']='0'*64;bad_img=temp/'bad.lmi';bad_img.write_text(json.dumps(broken))
+    code,corrupt=verify(binary,bad_img)
+    require(code==2 and corrupt['checks']['failure_stage']=='envelope_digest','tampered digest was not the first gate')
+    failed=subprocess.run([str(binary),'-restore',str(bad_img),'-data',str(temp/'badrestore')],capture_output=True,text=True,timeout=5)
+    require(failed.returncode!=0 and not (temp/'badrestore').exists(),'invalid backup published');observations={'restored_commit':result,'original_sequence':seed_seq,'precheck_digest':digest,'verified_scope':report['verified_scope']}
    elif name=='changes':
     tx=s.begin()
     for n in range(8,12):s.put(tx,tuple_(n))
@@ -143,6 +170,13 @@ def walkthrough(name,binary):
     s.call('POST',f'/transactions/{old}/rollback');reclaimed=s.call('POST','/vacuum',{'horizon':requested})
     require(reclaimed['removed']>=1,'obsolete version not reclaimed');s.call('POST','/query',{'relation':'spectra','at':seed_seq},410)
     s.call('POST','/checkpoint');s.stop();s.start();require(s.query()['rows'][0]['amplitude']==99,'vacuum did not survive restart');observations={'pinned':pinned,'reclaimed':reclaimed}
+    # A later backup has a newer head sequence but no longer serves the old
+    # snapshot; precheck and the live engine must give the same verdict.
+    pruned=temp/'pruned.lmi';pruned.write_bytes(s.call('GET','/backup',raw=True))
+    code,pruned_report=verify(binary,pruned,'-want-read',f'spectra@{seed_seq}')
+    require(code==1 and pruned_report['horizon']>seed_seq and not pruned_report['demands'][0]['satisfied'],'vacuumed image advertised an unreachable historical read')
+    code,_=verify(binary,pruned,'-want-read',f"spectra@{pruned_report['head']}")
+    require(code==0,'head snapshot of vacuumed image must remain readable')
    elif name=='transaction-close':
     tx=s.begin();s.put(tx,tuple_(8));s.call('POST',f'/transactions/{tx}/rollback');s.commit(tx,404)
     require(s.query()['matched']==7 and not s.stats()['active'],'rollback leaked state or pin')

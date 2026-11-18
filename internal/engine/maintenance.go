@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"lamina/internal/index"
 	"lamina/internal/journal"
@@ -8,11 +10,45 @@ import (
 	"lamina/internal/versions"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func (d *DB) image() snapshot.Image {
-	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
+	return snapshot.Image{
+		Format:   1,
+		Sequence: d.sequence,
+		Horizon:  d.horizon,
+		Origin:   d.origin(),
+		Catalog:  d.catalog.Clone(),
+		Store:    d.store.Clone(),
+	}
 }
+
+// origin records the current journal lineage. On a fresh database this is
+// the node's own journal id; after restore it stays the source lineage
+// until the captured state, while new commits run under the new journal id
+// exposed via stats and changes.
+func (d *DB) origin() *snapshot.Origin {
+	id := d.wal.IDHex()
+	if id == "" && d.originJournal == "" {
+		return nil
+	}
+	return &snapshot.Origin{
+		JournalID:  firstNonEmpty(d.originJournal, id),
+		Base:       d.wal.Base,
+		CapturedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func (d *DB) Checkpoint() (uint64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -39,10 +75,30 @@ func (d *DB) Backup() ([]byte, error) {
 	}
 	return b, nil
 }
-func Restore(dir string, data []byte) error {
-	image, err := snapshot.Decode(data)
+
+// Restore installs a validated backup into a new data directory.
+//
+// All validation happens before anything is created on disk:
+//  1. the file is read once as a regular file and its envelope digest
+//     recomputed,
+//  2. expectDigest (when supplied from a prior precheck) must equal the
+//     observed digest — any change between preview and install aborts,
+//  3. full structural validation runs through the same code as precheck,
+//
+// only then is the target directory created. A failure removes every
+// partial artifact, so an aborted install never pollutes the target path.
+func Restore(dir, backupPath, expectDigest string) error {
+	image, observed, err := snapshot.LoadVerified(backupPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("restore precheck failed: %w", err)
+	}
+	if expectDigest != "" {
+		if _, err = hex.DecodeString(expectDigest); err != nil || len(expectDigest) != sha256.Size*2 {
+			return fmt.Errorf("invalid expected digest")
+		}
+		if expectDigest != observed {
+			return fmt.Errorf("backup changed since precheck: observed digest %s, expected %s; install refused", observed, expectDigest)
+		}
 	}
 	if err = os.Mkdir(dir, 0700); err != nil {
 		return fmt.Errorf("restore requires a new directory: %w", err)
@@ -56,6 +112,9 @@ func Restore(dir string, data []byte) error {
 			os.Remove(dir)
 		}
 	}()
+	// The restored journal is a brand-new lineage: its header gets a fresh
+	// random id, while the source lineage remains recorded in the image
+	// origin and in the origin_journal_id stat.
 	w, err := journal.Open(dir, image.Sequence)
 	if err != nil {
 		return err

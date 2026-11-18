@@ -11,16 +11,13 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 	if err := d.usable(); err != nil {
 		return query.Result{}, err
 	}
-	r, err := d.catalog.Relation(q.Relation)
-	if err != nil {
-		return query.Result{}, invalid(err)
-	}
 	at := d.sequence
 	var tx *Transaction
 	if q.Transaction != "" {
 		if q.At != nil {
 			return query.Result{}, fault("invalid", "at and transaction are mutually exclusive")
 		}
+		var err error
 		tx, err = d.tx(q.Transaction)
 		if err != nil {
 			return query.Result{}, err
@@ -29,11 +26,13 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 	} else if q.At != nil {
 		at = *q.At
 	}
-	if at < d.horizon || at > d.sequence {
-		return query.Result{}, fault("snapshot", "snapshot unavailable; retained interval %d..%d", d.horizon, d.sequence)
+	// Same reachability gate the restore precheck runs against the image.
+	if err := reachFault(d.scope().CanRead(q.Relation, at)); err != nil {
+		return query.Result{}, err
 	}
-	if at < r.Created {
-		return query.Result{}, fault("snapshot", "relation did not exist at snapshot")
+	r, err := d.catalog.Relation(q.Relation)
+	if err != nil {
+		return query.Result{}, invalid(err)
 	}
 	if err = query.Bind(r, q); err != nil {
 		return query.Result{}, invalid(err)

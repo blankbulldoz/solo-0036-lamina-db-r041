@@ -1,7 +1,9 @@
 package journal
 
 import (
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
@@ -11,15 +13,32 @@ import (
 	"syscall"
 )
 
-const MaxFrame = 16 << 20
+const (
+	MaxFrame = 16 << 20
+
+	magicV1       = "LMW1"
+	headerV1Bytes = 16
+	magicV2       = "LMW2"
+	headerV2Bytes = 32
+)
 
 type WAL struct {
 	Base          uint64
+	ID            [16]byte
 	file          *os.File
 	lock          *os.File
 	Records       []Record
 	RecoveredTail int64
 	Poisoned      bool
+}
+
+// IDHex returns the durable journal lineage identifier. An empty string
+// means the journal predates identity headers (LMW1) and has no known ID.
+func (w *WAL) IDHex() string {
+	if w.ID == ([16]byte{}) {
+		return ""
+	}
+	return hex.EncodeToString(w.ID[:])
 }
 
 func Open(dir string, base uint64) (*WAL, error) {
@@ -46,10 +65,16 @@ func Open(dir string, base uint64) (*WAL, error) {
 		return nil, err
 	}
 	if info.Size() == 0 {
-		header := make([]byte, 16)
-		copy(header[:4], "LMW1")
+		var id [16]byte
+		if _, err = rand.Read(id[:]); err != nil {
+			w.Close()
+			return nil, err
+		}
+		header := make([]byte, headerV2Bytes)
+		copy(header[:4], magicV2)
 		binary.BigEndian.PutUint64(header[4:12], base)
-		binary.BigEndian.PutUint32(header[12:], crc32.ChecksumIEEE(header[:12]))
+		copy(header[12:28], id[:])
+		binary.BigEndian.PutUint32(header[28:], crc32.ChecksumIEEE(header[:28]))
 		if _, err = f.Write(header); err == nil {
 			err = f.Sync()
 		}
@@ -80,19 +105,50 @@ func Open(dir string, base uint64) (*WAL, error) {
 	return w, nil
 }
 func (w *WAL) recover() error {
-	var header [16]byte
-	if _, err := io.ReadFull(w.file, header[:]); err != nil {
+	// Read the 4-byte magic first so a legacy 16-byte LMW1 header is not
+	// rejected by a fixed-size probe for the 32-byte LMW2 header.
+	var magic [4]byte
+	if _, err := io.ReadFull(w.file, magic[:]); err != nil {
 		return fmt.Errorf("journal header: %w", err)
 	}
-	if string(header[:4]) != "LMW1" || crc32.ChecksumIEEE(header[:12]) != binary.BigEndian.Uint32(header[12:]) {
+	var headerLen int64
+	switch string(magic[:]) {
+	case magicV1:
+		var rest [12]byte
+		if _, err := io.ReadFull(w.file, rest[:]); err != nil {
+			return fmt.Errorf("journal header: %w", err)
+		}
+		if crc32.ChecksumIEEE(append(magic[:], rest[:8]...)) != binary.BigEndian.Uint32(rest[8:12]) {
+			return fmt.Errorf("invalid journal header")
+		}
+		headerLen = headerV1Bytes
+		actualBase := binary.BigEndian.Uint64(rest[0:8])
+		if actualBase > w.Base {
+			return fmt.Errorf("journal requires newer checkpoint")
+		}
+		w.Base = actualBase
+	case magicV2:
+		var rest [28]byte
+		if _, err := io.ReadFull(w.file, rest[:]); err != nil {
+			return fmt.Errorf("journal header: %w", err)
+		}
+		if crc32.ChecksumIEEE(append(magic[:], rest[:24]...)) != binary.BigEndian.Uint32(rest[24:28]) {
+			return fmt.Errorf("invalid journal header")
+		}
+		headerLen = headerV2Bytes
+		copy(w.ID[:], rest[8:24])
+		actualBase := binary.BigEndian.Uint64(rest[0:8])
+		if actualBase > w.Base {
+			return fmt.Errorf("journal requires newer checkpoint")
+		}
+		w.Base = actualBase
+	default:
 		return fmt.Errorf("invalid journal header")
 	}
-	actualBase := binary.BigEndian.Uint64(header[4:12])
-	if actualBase > w.Base {
-		return fmt.Errorf("journal requires newer checkpoint")
+	if _, err := w.file.Seek(headerLen, io.SeekStart); err != nil {
+		return err
 	}
-	w.Base = actualBase
-	offset := int64(16)
+	offset := headerLen
 	last := w.Base
 	for {
 		var head [8]byte
@@ -120,7 +176,7 @@ func (w *WAL) recover() error {
 		if err != nil {
 			return err
 		}
-		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(head[4:]) {
+		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(head[4:8]) {
 			return fmt.Errorf("journal checksum mismatch at %d", offset)
 		}
 		var r Record
